@@ -2975,6 +2975,7 @@ typedef struct {
     PyObject *struct_defaults;
     Py_ssize_t *struct_offsets;
     PyObject *struct_encode_fields;
+    PyObject *struct_omit_mask;
     struct StructInfo *struct_info;
     Py_ssize_t nkwonly;
     Py_ssize_t n_trailing_defaults;
@@ -5601,6 +5602,7 @@ typedef struct {
     /* Output values. All owned references. */
     PyObject *fields;
     PyObject *encode_fields;
+    PyObject *omit_mask;
     PyObject *defaults;
     PyObject *match_args;
     PyObject *tag;
@@ -6375,6 +6377,82 @@ structmeta_construct_offsets(
 }
 
 
+static int
+structmeta_construct_omit_mask(StructMetaInfo *info)
+{
+    PyObject *omit = PyDict_GetItemString(info->namespace, "__struct_omit__");
+    if (omit == NULL) {
+        info->omit_mask = NULL;
+        return 0;
+    }
+
+    if (!PyTuple_Check(omit) && !PyList_Check(omit)) {
+        PyErr_SetString(PyExc_TypeError, "__struct_omit__ must be a tuple or list of strings");
+        return -1;
+    }
+
+    Py_ssize_t nfields = PyTuple_GET_SIZE(info->fields);
+    info->omit_mask = PyBytes_FromStringAndSize(NULL, nfields);
+    if (info->omit_mask == NULL) return -1;
+    char *mask = PyBytes_AS_STRING(info->omit_mask);
+    memset(mask, 0, nfields);
+
+    PyObject *omit_set = PySet_New(omit);
+    if (omit_set == NULL) return -1;
+
+    for (Py_ssize_t i = 0; i < nfields; i++) {
+        PyObject *name = PyTuple_GET_ITEM(info->fields, i);
+        int rc = PySet_Contains(omit_set, name);
+        if (rc < 0) {
+            Py_DECREF(omit_set);
+            return -1;
+        }
+        if (rc) {
+            mask[i] = 1;
+        }
+    }
+
+    /* Ensure all omitted fields exist */
+    PyObject *fields_set = PySet_New(info->fields);
+    if (fields_set == NULL) {
+        Py_DECREF(omit_set);
+        return -1;
+    }
+
+    PyObject *iterator = PyObject_GetIter(omit_set);
+    if (iterator == NULL) {
+        Py_DECREF(fields_set);
+        Py_DECREF(omit_set);
+        return -1;
+    }
+
+    PyObject *item;
+    while ((item = PyIter_Next(iterator))) {
+        int rc = PySet_Contains(fields_set, item);
+        if (rc < 0) {
+            Py_DECREF(item);
+            Py_DECREF(iterator);
+            Py_DECREF(fields_set);
+            Py_DECREF(omit_set);
+            return -1;
+        }
+        if (rc == 0) {
+            PyErr_Format(PyExc_ValueError, "Field '%U' in __struct_omit__ is not a field of the struct", item);
+            Py_DECREF(item);
+            Py_DECREF(iterator);
+            Py_DECREF(fields_set);
+            Py_DECREF(omit_set);
+            return -1;
+        }
+        Py_DECREF(item);
+    }
+    Py_DECREF(iterator);
+    Py_DECREF(fields_set);
+    Py_DECREF(omit_set);
+
+    return 0;
+}
+
 static PyObject *
 StructMeta_new_inner(
     PyTypeObject *type, PyObject *name, PyObject *bases, PyObject *namespace,
@@ -6399,6 +6477,7 @@ StructMeta_new_inner(
         .renamed_fields = NULL,
         .fields = NULL,
         .encode_fields = NULL,
+        .omit_mask = NULL,
         .defaults = NULL,
         .match_args = NULL,
         .tag = NULL,
@@ -6499,6 +6578,9 @@ StructMeta_new_inner(
     /* Construct encode_fields */
     if (structmeta_construct_encode_fields(&info) < 0) goto cleanup;
 
+    /* Construct omit_mask */
+    if (structmeta_construct_omit_mask(&info) < 0) goto cleanup;
+
     /* Construct type */
     PyObject *args = Py_BuildValue("(OOO)", name, bases, info.namespace);
     if (args == NULL) goto cleanup;
@@ -6566,6 +6648,8 @@ StructMeta_new_inner(
     cls->struct_defaults = info.defaults;
     Py_INCREF(info.encode_fields);
     cls->struct_encode_fields = info.encode_fields;
+    Py_XINCREF(info.omit_mask);
+    cls->struct_omit_mask = info.omit_mask;
     Py_INCREF(info.match_args);
     cls->match_args = info.match_args;
     Py_XINCREF(info.tag);
@@ -6599,6 +6683,7 @@ cleanup:
     /* Constructed outputs */
     Py_XDECREF(info.fields);
     Py_XDECREF(info.encode_fields);
+    Py_XDECREF(info.omit_mask);
     Py_XDECREF(info.defaults);
     Py_XDECREF(info.match_args);
     Py_XDECREF(info.tag);
@@ -7010,6 +7095,7 @@ StructMeta_traverse(StructMetaObject *self, visitproc visit, void *arg)
     Py_VISIT(self->struct_fields);
     Py_VISIT(self->struct_defaults);
     Py_VISIT(self->struct_encode_fields);
+    Py_VISIT(self->struct_omit_mask);
     Py_VISIT(self->struct_tag);  /* May be a function */
     Py_VISIT(self->rename);  /* May be a function */
     Py_VISIT(self->post_init);
@@ -7026,6 +7112,7 @@ StructMeta_clear(StructMetaObject *self)
     Py_CLEAR(self->struct_fields);
     Py_CLEAR(self->struct_defaults);
     Py_CLEAR(self->struct_encode_fields);
+    Py_CLEAR(self->struct_omit_mask);
     Py_CLEAR(self->struct_tag_field);
     Py_CLEAR(self->struct_tag_value);
     Py_CLEAR(self->struct_tag);
@@ -13120,6 +13207,7 @@ mpack_encode_struct_object(
     PyObject *fields = struct_type->struct_encode_fields;
     Py_ssize_t nfields = PyTuple_GET_SIZE(fields);
     Py_ssize_t len = nfields + tagged;
+    const char *omit_mask = struct_type->struct_omit_mask ? PyBytes_AS_STRING(struct_type->struct_omit_mask) : NULL;
 
     if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
 
@@ -13136,6 +13224,10 @@ mpack_encode_struct_object(
         nunchecked -= PyTuple_GET_SIZE(struct_type->struct_defaults);
     }
     for (Py_ssize_t i = 0; i < nunchecked; i++) {
+        if (omit_mask && omit_mask[i]) {
+            actual_len--;
+            continue;
+        }
         PyObject *key = PyTuple_GET_ITEM(fields, i);
         PyObject *val = Struct_get_index(obj, i);
         if (MS_UNLIKELY(val == NULL)) goto cleanup;
@@ -13148,6 +13240,10 @@ mpack_encode_struct_object(
         }
     }
     for (Py_ssize_t i = nunchecked; i < nfields; i++) {
+        if (omit_mask && omit_mask[i]) {
+            actual_len--;
+            continue;
+        }
         PyObject *key = PyTuple_GET_ITEM(fields, i);
         PyObject *val = Struct_get_index(obj, i);
         if (val == NULL) goto cleanup;
@@ -14409,11 +14505,13 @@ json_encode_struct_object(
     }
     PyObject *key, *val, *fields, *defaults, *tag_field, *tag_value;
     Py_ssize_t i, nfields, nunchecked;
+    const char *omit_mask;
     int status = -1;
     tag_field = struct_type->struct_tag_field;
     tag_value = struct_type->struct_tag_value;
     fields = struct_type->struct_encode_fields;
     defaults = struct_type->struct_defaults;
+    omit_mask = struct_type->struct_omit_mask ? PyBytes_AS_STRING(struct_type->struct_omit_mask) : NULL;
     nfields = PyTuple_GET_SIZE(fields);
     nunchecked = nfields;
     if (struct_type->omit_defaults == OPT_TRUE) {
@@ -14431,6 +14529,7 @@ json_encode_struct_object(
     }
 
     for (i = 0; i < nunchecked; i++) {
+        if (omit_mask && omit_mask[i]) continue;
         key = PyTuple_GET_ITEM(fields, i);
         val = Struct_get_index(obj, i);
         if (MS_UNLIKELY(val == NULL)) goto cleanup;
@@ -14441,6 +14540,7 @@ json_encode_struct_object(
         if (ms_write(self, ",", 1) < 0) goto cleanup;
     }
     for (i = nunchecked; i < nfields; i++) {
+        if (omit_mask && omit_mask[i]) continue;
         key = PyTuple_GET_ITEM(fields, i);
         val = Struct_get_index(obj, i);
         if (MS_UNLIKELY(val == NULL)) goto cleanup;
