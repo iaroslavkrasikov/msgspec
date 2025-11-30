@@ -5599,6 +5599,7 @@ typedef struct {
     PyObject *slots;
     PyObject *namespace;
     PyObject *renamed_fields;
+    PyObject *omitted_fields;
     /* Output values. All owned references. */
     PyObject *fields;
     PyObject *encode_fields;
@@ -5762,6 +5763,18 @@ structmeta_collect_base(StructMetaInfo *info, MsgspecState *mod, PyObject *base)
         Py_DECREF(offset);
         if (errored) return -1;
     }
+
+    /* Inherit omitted fields */
+    if (st_type->struct_omit_mask != NULL) {
+        char *mask = PyBytes_AS_STRING(st_type->struct_omit_mask);
+        for (Py_ssize_t i = 0; i < nfields; i++) {
+            if (mask[i]) {
+                PyObject *field = PyTuple_GET_ITEM(fields, i);
+                if (PySet_Add(info->omitted_fields, field) < 0) return -1;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -6381,14 +6394,38 @@ static int
 structmeta_construct_omit_mask(StructMetaInfo *info)
 {
     PyObject *omit = PyDict_GetItemString(info->namespace, "__struct_omit__");
-    if (omit == NULL) {
-        info->omit_mask = NULL;
-        return 0;
+    if (omit != NULL) {
+        if (!PyTuple_Check(omit) && !PyList_Check(omit)) {
+            PyErr_SetString(PyExc_TypeError, "__struct_omit__ must be a tuple or list of strings");
+            return -1;
+        }
+        PyObject *omit_set = PySet_New(omit);
+        if (omit_set == NULL) return -1;
+        
+        /* Merge with inherited omitted fields */
+        Py_ssize_t len = PySet_GET_SIZE(omit_set);
+        PyObject *iterator = PyObject_GetIter(omit_set);
+        if (iterator == NULL) {
+            Py_DECREF(omit_set);
+            return -1;
+        }
+        PyObject *item;
+        while ((item = PyIter_Next(iterator))) {
+            if (PySet_Add(info->omitted_fields, item) < 0) {
+                Py_DECREF(item);
+                Py_DECREF(iterator);
+                Py_DECREF(omit_set);
+                return -1;
+            }
+            Py_DECREF(item);
+        }
+        Py_DECREF(iterator);
+        Py_DECREF(omit_set);
     }
 
-    if (!PyTuple_Check(omit) && !PyList_Check(omit)) {
-        PyErr_SetString(PyExc_TypeError, "__struct_omit__ must be a tuple or list of strings");
-        return -1;
+    if (PySet_GET_SIZE(info->omitted_fields) == 0) {
+        info->omit_mask = NULL;
+        return 0;
     }
 
     Py_ssize_t nfields = PyTuple_GET_SIZE(info->fields);
@@ -6397,16 +6434,10 @@ structmeta_construct_omit_mask(StructMetaInfo *info)
     char *mask = PyBytes_AS_STRING(info->omit_mask);
     memset(mask, 0, nfields);
 
-    PyObject *omit_set = PySet_New(omit);
-    if (omit_set == NULL) return -1;
-
     for (Py_ssize_t i = 0; i < nfields; i++) {
         PyObject *name = PyTuple_GET_ITEM(info->fields, i);
-        int rc = PySet_Contains(omit_set, name);
-        if (rc < 0) {
-            Py_DECREF(omit_set);
-            return -1;
-        }
+        int rc = PySet_Contains(info->omitted_fields, name);
+        if (rc < 0) return -1;
         if (rc) {
             mask[i] = 1;
         }
@@ -6414,15 +6445,11 @@ structmeta_construct_omit_mask(StructMetaInfo *info)
 
     /* Ensure all omitted fields exist */
     PyObject *fields_set = PySet_New(info->fields);
-    if (fields_set == NULL) {
-        Py_DECREF(omit_set);
-        return -1;
-    }
+    if (fields_set == NULL) return -1;
 
-    PyObject *iterator = PyObject_GetIter(omit_set);
+    PyObject *iterator = PyObject_GetIter(info->omitted_fields);
     if (iterator == NULL) {
         Py_DECREF(fields_set);
-        Py_DECREF(omit_set);
         return -1;
     }
 
@@ -6433,7 +6460,6 @@ structmeta_construct_omit_mask(StructMetaInfo *info)
             Py_DECREF(item);
             Py_DECREF(iterator);
             Py_DECREF(fields_set);
-            Py_DECREF(omit_set);
             return -1;
         }
         if (rc == 0) {
@@ -6441,14 +6467,12 @@ structmeta_construct_omit_mask(StructMetaInfo *info)
             Py_DECREF(item);
             Py_DECREF(iterator);
             Py_DECREF(fields_set);
-            Py_DECREF(omit_set);
             return -1;
         }
         Py_DECREF(item);
     }
     Py_DECREF(iterator);
     Py_DECREF(fields_set);
-    Py_DECREF(omit_set);
 
     return 0;
 }
@@ -6517,6 +6541,8 @@ StructMeta_new_inner(
     if (info.namespace == NULL) goto cleanup;
     info.renamed_fields = PyDict_New();
     if (info.renamed_fields == NULL) goto cleanup;
+    info.omitted_fields = PySet_New(NULL);
+    if (info.omitted_fields == NULL) goto cleanup;
     info.slots = PyList_New(0);
     if (info.slots == NULL) goto cleanup;
 
@@ -6677,6 +6703,7 @@ cleanup:
     Py_XDECREF(info.defaults_lk);
     Py_XDECREF(info.offsets_lk);
     Py_XDECREF(info.kwonly_fields);
+    Py_XDECREF(info.omitted_fields);
     Py_XDECREF(info.slots);
     Py_XDECREF(info.namespace);
     Py_XDECREF(info.renamed_fields);
@@ -8225,11 +8252,13 @@ struct_asdict(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
     StructMetaObject *struct_type = (StructMetaObject *)Py_TYPE(obj);
     PyObject *fields = struct_type->struct_fields;
     Py_ssize_t nfields = PyTuple_GET_SIZE(fields);
+    const char *omit_mask = struct_type->struct_omit_mask ? PyBytes_AS_STRING(struct_type->struct_omit_mask) : NULL;
 
     PyObject *out = PyDict_New();
     if (out == NULL) return NULL;
 
     for (Py_ssize_t i = 0; i < nfields; i++) {
+        if (omit_mask && omit_mask[i]) continue;
         PyObject *key = PyTuple_GET_ITEM(fields, i);
         PyObject *val = Struct_get_index(obj, i);
         if (val == NULL) goto error;
