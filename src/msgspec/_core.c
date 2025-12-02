@@ -7822,6 +7822,7 @@ Struct_repr(PyObject *self) {
     Py_ssize_t nfields = PyTuple_GET_SIZE(fields);
     PyObject *defaults = NULL;
     Py_ssize_t nunchecked = nfields;
+    const char *omit_mask = st_type->struct_omit_mask ? PyBytes_AS_STRING(st_type->struct_omit_mask) : NULL;
 
     if (omit_defaults) {
         defaults = st_type->struct_defaults;
@@ -7840,6 +7841,7 @@ Struct_repr(PyObject *self) {
     if (!strbuilder_extend_literal(&builder, "(")) goto error;
 
     for (Py_ssize_t i = 0; i < nfields; i++) {
+        if (omit_mask && omit_mask[i]) continue;
         PyObject *field = PyTuple_GET_ITEM(fields, i);
         PyObject *val = Struct_get_index(self, i);
         if (val == NULL) goto error;
@@ -8409,6 +8411,7 @@ Struct_rich_repr(PyObject *self, PyObject *args) {
     Py_ssize_t nfields = PyTuple_GET_SIZE(fields);
     PyObject *defaults = NULL;
     Py_ssize_t nunchecked = nfields;
+    const char *omit_mask = st_type->struct_omit_mask ? PyBytes_AS_STRING(st_type->struct_omit_mask) : NULL;
 
     if (omit_defaults) {
         defaults = st_type->struct_defaults;
@@ -8419,6 +8422,7 @@ Struct_rich_repr(PyObject *self, PyObject *args) {
     if (out == NULL) return NULL;
 
     for (Py_ssize_t i = 0; i < nfields; i++) {
+        if (omit_mask && omit_mask[i]) continue;
         PyObject *field = PyTuple_GET_ITEM(fields, i);
         PyObject *val = Struct_get_index(self, i);
 
