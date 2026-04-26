@@ -845,7 +845,7 @@ additional features.
     msgspec.ValidationError: Expected `int`, got `str` - at `$.age`
 
 Other types that duck-type as ``dataclasses`` are also supported, such as
-`pydantic dataclasses <https://docs.pydantic.dev/latest/usage/dataclasses/>`__.
+`pydantic dataclasses <https://pydantic.dev/docs/validation/latest/concepts/dataclasses/>`__.
 
 .. code-block:: python
 
@@ -1143,6 +1143,7 @@ purpose, but with a `typing.Literal` the decoded values are literal `int` or
 A literal can be composed of any of the following objects:
 
 - `None`
+- `bool` values (`True` and `False`)
 - `int` values
 - `str` values
 - Nested `typing.Literal` types
@@ -1169,6 +1170,12 @@ values, or doesn't match any of their component types.
     Traceback (most recent call last):
       File "<stdin>", line 1, in <module>
     msgspec.ValidationError: Expected `int`, got `str`
+
+    >>> msgspec.json.decode(b'true', type=Literal[True])
+    True
+
+    >>> msgspec.json.decode(b'false', type=Literal[True, False])
+    False
 
 ``NewType``
 -----------
@@ -1598,7 +1605,7 @@ TOML_ types are decoded to Python types as follows:
 .. _MessagePack: https://msgpack.org
 .. _YAML: https://yaml.org
 .. _TOML: https://toml.io/en/
-.. _pydantic: https://docs.pydantic.dev/latest/
+.. _pydantic: https://pydantic.dev/docs/validation/latest/get-started/
 .. _pendulum: https://pendulum.eustace.io/
 .. _RFC8259: https://datatracker.ietf.org/doc/html/rfc8259
 .. _RFC3339: https://datatracker.ietf.org/doc/html/rfc3339

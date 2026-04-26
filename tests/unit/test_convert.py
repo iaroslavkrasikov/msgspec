@@ -880,6 +880,25 @@ class TestEnum:
         with pytest.raises(ValidationError, match="Invalid enum value 6"):
             msgspec.convert(6, Ex)
 
+    @pytest.mark.parametrize(
+        "base_metacls", [enum.EnumMeta] + ([enum.EnumType] if PY311 else [])
+    )
+    def test_enum_with_custom_metaclass(self, base_metacls):
+        class ChoicesMeta(base_metacls):
+            """My custom enum metaclass"""
+
+        class Test(enum.Enum, metaclass=ChoicesMeta):
+            A = "apple"
+            B = "banana"
+
+        assert convert(Test.A, Test) is Test.A
+        assert convert("apple", Test) is Test.A
+        assert convert("banana", Test) is Test.B
+        with pytest.raises(ValidationError, match="Invalid enum value 'ceeee'"):
+            convert("ceeee", Test)
+        with pytest.raises(ValidationError, match="Expected `str`, got `int`"):
+            convert(1, Test)
+
 
 class TestLiteral:
     def test_str_literal(self):
@@ -901,6 +920,18 @@ class TestLiteral:
             convert(-3, typ)
         with pytest.raises(ValidationError, match="Expected `int`, got `str`"):
             convert("A", typ)
+
+    def test_bool_literal(self):
+        assert convert(True, Literal[True]) is True
+        assert convert(False, Literal[False]) is False
+        assert convert(True, Literal[True, False]) is True
+        assert convert(False, Literal[True, False]) is False
+        with pytest.raises(ValidationError, match="Invalid enum value False"):
+            convert(False, Literal[True])
+        with pytest.raises(ValidationError, match="Invalid enum value True"):
+            convert(True, Literal[False])
+        with pytest.raises(ValidationError, match="Expected `bool`, got `str`"):
+            convert("yes", Literal[True])
 
 
 class TestSequences:
@@ -1112,6 +1143,23 @@ class TestNamedTuple:
 
         with pytest.raises(ValidationError, match="Expected `str`, got `int`"):
             convert(msg, Ex3)
+
+    def test_namedtuple_hash_preserved(self):
+        """Hash of converted NamedTuple matches hash of original.
+
+        Regression test for gh-967."""
+
+        class Key(NamedTuple):
+            value: int
+
+        original = Key(value=42)
+        converted = convert([42], Key)
+
+        assert original == converted
+        assert hash(original) == hash(converted)
+
+        d = {original: "found"}
+        assert converted in d
 
 
 class TestDict:

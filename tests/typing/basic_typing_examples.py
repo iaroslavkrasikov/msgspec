@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime
 import decimal
 import pickle
-from typing import Any, Dict, Final, List, Type, Union
+from typing import Annotated, Any, Dict, Final, List, Literal, Type, Union
 
 import msgspec
 
@@ -32,6 +32,11 @@ def check_unset_type_lowering(x: int | msgspec.UnsetType) -> None:
     if x is msgspec.UNSET:
         reveal_type(x)  # assert "int" not in typ.lower()
     else:
+        reveal_type(x)  # assert "unset" not in typ.lower()
+
+
+def check_unset_type_truthiness_lowering(x: str | msgspec.UnsetType) -> None:
+    if x:
         reveal_type(x)  # assert "unset" not in typ.lower()
 
 
@@ -382,7 +387,15 @@ def check_defstruct() -> None:
 def check_defstruct_field_types() -> None:
     Test = msgspec.defstruct(
         "Test",
-        ("x", ("y", int), ("z", str, "default"))
+        (
+            "x",
+            ("a", int),
+            ("b", int | None),
+            ("c", list[int]),
+            ("d", Annotated[int, msgspec.Meta(ge=0)]),
+            ("e", Literal["a", "b"]),
+            ("f", str, "default"),
+        ),
     )
 
 

@@ -292,6 +292,26 @@ class TestDecoder:
         with pytest.raises(TypeError, match="Oh no!"):
             dec.decode(msg)
 
+    @pytest.mark.parametrize(
+        "base_error_cls", [msgspec.ValidationError, msgspec.DecodeError]
+    )
+    def test_dec_hook_validation_error_subclass_propagates_directly(
+        self, proto, base_error_cls
+    ):
+        class MyError(base_error_cls):
+            pass
+
+        class Foo:
+            pass
+
+        def dec_hook(tp, val):
+            raise MyError("custom message")
+
+        dec = proto.Decoder(type=Foo, dec_hook=dec_hook)
+
+        with pytest.raises(MyError, match="custom message"):
+            dec.decode(b"[]")
+
 
 @pytest.mark.skipif(
     PY312,
@@ -648,6 +668,20 @@ class TestEnum:
 
         assert proto.encode(Test.A) == proto.encode("apple")
 
+    @pytest.mark.parametrize(
+        "base_metacls", [enum.EnumMeta] + ([enum.EnumType] if PY311 else [])
+    )
+    def test_enum_with_custom_enum_metaclass(self, proto, base_metacls):
+        class ChoicesMeta(base_metacls):
+            """My custom enum metaclass"""
+
+        class Test(enum.Enum, metaclass=ChoicesMeta):
+            A = "apple"
+            B = "banana"
+
+        assert proto.encode(Test.A) == proto.encode("apple")
+        assert proto.decode(proto.encode("apple"), type=Test) is Test.A
+
     @pytest.mark.parametrize("base_cls", [StrEnum, enum.Enum])
     def test_decode(self, proto, base_cls):
         class Test(base_cls):
@@ -835,13 +869,8 @@ class TestLiterals:
     @pytest.mark.parametrize(
         "typ",
         [
-            Literal[1, False],
             Literal["ok", b"bad"],
             Literal[1, object()],
-            Union[Literal[1, 2], Literal[3, False]],
-            Union[Literal["one", "two"], Literal[3, False]],
-            Literal[Literal[1, 2], Literal[3, False]],
-            Literal[Literal["one", "two"], Literal[3, False]],
             Literal[1, 2, List[int]],
             Literal[1, 2, List],
         ],
@@ -917,6 +946,34 @@ class TestLiterals:
 
         with pytest.raises(ValidationError, match="Invalid enum value 'carrot'"):
             dec.decode(msgspec.msgpack.encode("carrot"))
+
+    @pytest.mark.parametrize(
+        "typ, good, bad",
+        [
+            (Literal[True], [True], [False]),
+            (Literal[False], [False], [True]),
+            (Literal[True, False], [True, False], []),
+            (Literal[1, False], [1, False], [True]),
+            (Literal[True, "yes", None], [True, "yes", None], [False]),
+        ],
+    )
+    def test_literal_bool(self, typ, good, bad):
+        dec = msgspec.msgpack.Decoder(typ)
+        for val in good:
+            assert dec.decode(msgspec.msgpack.encode(val)) == val
+        for val in bad:
+            with pytest.raises(ValidationError):
+                dec.decode(msgspec.msgpack.encode(val))
+
+    def test_literal_bool_error_message(self):
+        dec = msgspec.msgpack.Decoder(Literal[True])
+        with pytest.raises(ValidationError, match="Invalid enum value False"):
+            dec.decode(msgspec.msgpack.encode(False))
+
+    def test_mix_bool_and_bool_literal(self):
+        dec = msgspec.msgpack.Decoder(Union[Literal[True], bool])
+        assert dec.decode(msgspec.msgpack.encode(True)) is True
+        assert dec.decode(msgspec.msgpack.encode(False)) is False
 
     def test_mix_int_and_int_literal(self):
         dec = msgspec.msgpack.Decoder(Union[Literal[-1, 1], int])
@@ -2491,6 +2548,29 @@ class TestNamedTuple:
                 proto.decode(proto.encode(msg2), type=mod.Ex[int])
             assert "`$[1][0]`" in str(rec.value)
             assert "Expected `int`, got `str`" in str(rec.value)
+
+    def test_namedtuple_hash_preserved_after_roundtrip(self, proto):
+        """Hash of deserialized NamedTuple matches hash of original.
+
+        Regression test for gh-967. In Python 3.14+, tuples cache their hash
+        in ob_hash. When msgspec allocates NamedTuples via tp_alloc (which
+        zero-initializes memory), ob_hash was left at 0 — a valid cached hash
+        — so hash() returned 0 for all deserialized NamedTuples."""
+
+        class Key(NamedTuple):
+            value: int
+
+        original = Key(value=42)
+        encoded = proto.encode(original)
+        decoded = proto.decode(encoded, type=Key)
+
+        assert original == decoded
+        assert hash(original) == hash(decoded)
+
+        # Verify dict lookup works (requires matching hash)
+        d = {original: "found"}
+        assert decoded in d
+        assert d[decoded] == "found"
 
 
 class TestDataclass:
@@ -4080,6 +4160,22 @@ class TestUnset:
             res = proto.encode(x)
             sol = proto.encode(y)
             assert res == sol
+
+
+class TestSet:
+    def test_encode_set_doesnt_leak_item_refs(self, proto):
+        class Ex:
+            pass
+
+        items = {Ex(), Ex(), Ex()}
+        refs = [weakref.ref(item) for item in items]
+
+        proto.Encoder(enc_hook=lambda x: None).encode(items)
+
+        del items
+        gc.collect()
+
+        assert all(ref() is None for ref in refs)
 
 
 class TestOrder:
